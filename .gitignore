@@ -2,19 +2,52 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-models/*
-models_hf/7B
+# Virtual environments
+.env
+.env.*
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# Datasets and raw data files
+datasets/*.json
+datasets_all/
+datasets/spider/
+ft_datasets/
+*.json
+# Whitelist configuration JSONs
+!ds_config*.json
+!configs/*.json
+
+# Model weights, checkpoints, and output artifacts
+models/
+models_hf/7B/
+models_hf/13B/
+models_hf/70B/
 models_hf/output*
-datasets_all/*
-datasets/spider/*
-ft_datasets/*
-llama2_recipies/*
-llama2_repo/*
-pictures/*
+output_*/
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.gguf
+*.ggml
 
-
-
+# External / Temporary repos and logs
+llama2_recipies/
+llama2_repo/
+pictures/
+wandb/
+*.log

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlllama"
+version = "0.2.0"
+description = "Supervised Fine-Tuning of LLaMA-2 for Relational Text-to-SQL Semantic Parsing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Taha-JN"}
+]
+dependencies = [
+    "torch>=2.0.1",
+    "transformers>=4.31.0",
+    "accelerate>=0.21.0",
+    "deepspeed>=0.10.0",
+    "datasets>=2.14.0",
+    "sqlglot>=17.8.0",
+    "pandas>=2.0.3",
+    "numpy>=1.25.1",
+    "sentencepiece>=0.1.99",
+    "protobuf>=4.23.4",
+    "safetensors>=0.3.1",
+    "matplotlib>=3.7.2",
+    "scipy>=1.11.1",
+]
+
+[project.optional-dependencies]
+inference = [
+    "llama-cpp-python>=0.1.77",
+]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+pythonpath = ["src"]

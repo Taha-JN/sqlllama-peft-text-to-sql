@@ -1,31 +1,31 @@
+"""
+SQL-LLaMA: Distributed Fine-Tuning Pipeline for Text-to-SQL Semantic Parsing.
+
+Attribution Notice:
+Training script adapted from Stanford Alpaca's open-source train.py.
+Original work Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li.
+Licensed under the Apache License, Version 2.0.
+"""
+
 from copy import deepcopy
+import json
 import logging
+import random
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Sequence
+from typing import Optional, Dict, Sequence, List, Any
+
+logger = logging.getLogger(__name__)
 
 import torch
 import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
 
-import json
-
 IGNORE_INDEX = (
     -100
 )  # Used in Transformers for Masking https://huggingface.co/docs/transformers/glossary#l
 DEFAULT_PAD_TOKEN = "[PAD]"
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-}
+from sqlllama.prompts import PROMPT_DICT
 
 @dataclass
 class ModelArguments:
@@ -48,6 +48,18 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={
             "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
         },
+    )
+    evaluation_strategy: str = field(
+        default="steps",
+        metadata={"help": "The evaluation strategy to use during training."},
+    )
+    eval_steps: int = field(
+        default=100,
+        metadata={"help": "Run an evaluation every X steps."},
+    )
+    load_best_model_at_end: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to load the best model at the end of training."},
     )
 
 
@@ -130,15 +142,22 @@ def preprocess(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(
+        self,
+        tokenizer: transformers.PreTrainedTokenizer,
+        data_path: Optional[str] = None,
+        list_data_dict: Optional[List[Dict[str, Any]]] = None,
+        split_name: str = "train",
+    ):
         super(SupervisedDataset, self).__init__()
-        logging.warning("Loading Dataset as .json from Path: " + data_path)
+        if list_data_dict is None:
+            if data_path is None:
+                raise ValueError("Either data_path or list_data_dict must be provided.")
+            logger.info("Loading Dataset as .json from Path: %s", data_path)
+            with open(data_path, "r", encoding="utf-8") as f:
+                list_data_dict = json.load(f)
 
-        f = open(data_path)
-        list_data_dict = json.load(f)
-        f.close()
-
-        logging.warning("...formatting inputs to Alpaca-Style...")
+        logger.info("Formatting %d %s inputs to Alpaca-Style...", len(list_data_dict), split_name)
         prompt_input, prompt_no_input = (
             PROMPT_DICT["prompt_input"],
             PROMPT_DICT["prompt_no_input"],
@@ -154,13 +173,17 @@ class SupervisedDataset(Dataset):
 
             targets.append(f"{example['output']}{tokenizer.eos_token}")
 
-        logging.warning("Tokenizing inputs, this may take some time...")
+        logger.info(
+            "Tokenizing %s inputs (%d samples), this may take some time...",
+            split_name,
+            len(sources),
+        )
         data_dict = preprocess(sources, targets, tokenizer)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
 
-        logging.warning("Initialization of SupervisedDataset done!")
+        logger.info("Initialization of SupervisedDataset (%s) done!", split_name)
 
     def __len__(self):
         return len(self.input_ids)
@@ -198,40 +221,63 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer, data_args
 ) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
+    """Make dataset and collator for supervised fine-tuning with a 90/10 train/val split."""
+    logger.info("Loading raw dataset from %s for train/eval splitting...", data_args.data_path)
+    with open(data_args.data_path, "r", encoding="utf-8") as f:
+        list_data_dict = json.load(f)
+
+    # Deterministic 90% Training / 10% Validation split
+    random.seed(42)
+    indices = list(range(len(list_data_dict)))
+    random.shuffle(indices)
+
+    split_idx = int(0.9 * len(indices))
+    train_indices = indices[:split_idx]
+    eval_indices = indices[split_idx:]
+
+    train_data = [list_data_dict[i] for i in train_indices]
+    eval_data = [list_data_dict[i] for i in eval_indices]
+
+    logger.info(
+        "Dataset split complete: Total=%d | Train=%d (90.0%%) | Eval=%d (10.0%%)",
+        len(list_data_dict),
+        len(train_data),
+        len(eval_data),
+    )
 
     train_dataset = SupervisedDataset(
-        tokenizer=tokenizer, data_path=data_args.data_path
+        tokenizer=tokenizer, list_data_dict=train_data, split_name="train"
+    )
+    eval_dataset = SupervisedDataset(
+        tokenizer=tokenizer, list_data_dict=eval_data, split_name="eval"
     )
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
     return dict(
-        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
     )
 
 
 def train():
     """Training Loop for SQL-LLaMA using LLaMA2 with HF-Transformers and Alpaca Instruction-Style"""
 
-    logging.warning("Parsing HF-Transformers Arguments")
+    logger.info("Parsing HF-Transformers Arguments")
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    logging.warning(
-        "Setting up Pretrained-Model: " + str(model_args.model_name_or_path)
-    )
+    logger.info("Setting up Pretrained-Model: %s", model_args.model_name_or_path)
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
-    
-    params = model.parameters()
 
-    logging.warning("Setting up Tokenizer from: " + str(model_args.model_name_or_path))
+    logger.info("Setting up Tokenizer from: %s", model_args.model_name_or_path)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -241,10 +287,9 @@ def train():
         use_fast=False,
     )
 
-    logging.warning(
-        "Add Tokenizer Padding: "
-        + str(DEFAULT_PAD_TOKEN)
-        + " and resize Transformer-Embeddings accordingly"
+    logger.info(
+        "Add Tokenizer Padding: %s and resize Transformer-Embeddings accordingly",
+        DEFAULT_PAD_TOKEN,
     )
 
     if tokenizer.pad_token is None:
@@ -254,34 +299,43 @@ def train():
             model=model,
         )
 
-    logging.warning(
-        "Using the Following Special Token-IDs and Tokens: "
-        + " " + str(tokenizer.pad_token)
-        + " " + str(tokenizer.pad_token_id)
-        + " " + str(tokenizer.eos_token)
-        + " " + str(tokenizer.eos_token_id)
-        + " " + str(tokenizer.bos_token)
-        + " " + str(tokenizer.bos_token_id)
-        + " " + str(tokenizer.unk_token)
-        + " " + str(tokenizer.unk_token_id)
+    logger.info(
+        "Using Special Tokens: pad=%s (%s), eos=%s (%s), bos=%s (%s), unk=%s (%s)",
+        tokenizer.pad_token,
+        tokenizer.pad_token_id,
+        tokenizer.eos_token,
+        tokenizer.eos_token_id,
+        tokenizer.bos_token,
+        tokenizer.bos_token_id,
+        tokenizer.unk_token,
+        tokenizer.unk_token_id,
     )
 
-    logging.warning(
-        "Setting data_module and data_collator using Alpaca-Style defined in PROMPT_DICT above."
+    logger.info(
+        "Setting data_module and data_collator using Alpaca-Style defined in PROMPT_DICT"
     )
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     
-    logging.warning(
-        "Set HF-Trainer, Train the Model and Save to Directory: "
-        + str(training_args.output_dir)
+    logger.info(
+        "Set HF-Trainer with validation evaluation, Train the Model and Save to Directory: %s",
+        training_args.output_dir,
     )
     trainer = Trainer(
-        model=model, tokenizer=tokenizer, args=training_args, **data_module
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=data_module["train_dataset"],
+        eval_dataset=data_module["eval_dataset"],
+        data_collator=data_module["data_collator"],
     )
     trainer.train()
     trainer.save_model(output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        level=logging.INFO,
+    )
     train()
